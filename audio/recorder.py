@@ -1,7 +1,9 @@
 """Record audio from the microphone."""
 
 import math
+import queue
 import time
+from typing import Callable
 
 import numpy as np
 
@@ -9,6 +11,7 @@ import config
 from audio.devices import require_sounddevice
 from audio.exceptions import DeviceError
 from audio.levels import level_bar, rms_dbfs
+from audio.vad import EnergyVAD, SpeechSegmenter
 
 
 def record(
@@ -71,3 +74,56 @@ def monitor_levels(
     if state["problems"]:
         print(f"Note: {state['problems']} stream warnings (audio blocks were dropped).")
     return state["max_db"]
+
+
+def record_until_silence(
+    max_seconds: float = config.MAX_RECORD_SECONDS,
+    silence_seconds: float = config.SILENCE_SECONDS,
+    start_timeout: float = config.START_TIMEOUT_SECONDS,
+    sample_rate: int = config.SAMPLE_RATE,
+    device=config.INPUT_DEVICE,
+    on_event: Callable[[str], None] | None = None,
+) -> tuple[np.ndarray | None, str]:
+    """Record until the speaker stops talking.
+
+    Returns (audio, stop_reason). audio is 1-D int16, or None if nobody spoke.
+    stop_reason is "silence", "no_speech" or "max_length".
+    on_event(name) is called with "calibrated" and "speech_start" so the UI can react.
+
+    How it works: the stream callback only copies each small chunk into a queue
+    (callbacks must be quick). The main loop takes chunks out of the queue and
+    gives them to the SpeechSegmenter, which decides when to stop.
+    """
+    sd = require_sounddevice()
+    frame_length = int(sample_rate * config.VAD_FRAME_MS / 1000)
+    vad = EnergyVAD(
+        calibration_frames=max(int(config.VAD_CALIBRATION_SECONDS * 1000 / config.VAD_FRAME_MS), 1),
+        margin_db=config.VAD_MARGIN_DB,
+        min_threshold_db=config.VAD_MIN_THRESHOLD_DBFS,
+        max_threshold_db=config.VAD_MAX_THRESHOLD_DBFS,
+    )
+    segmenter = SpeechSegmenter(
+        vad, sample_rate, frame_length,
+        silence_seconds=silence_seconds, start_timeout=start_timeout,
+        max_seconds=max_seconds, pre_roll_seconds=config.PRE_ROLL_SECONDS,
+    )
+    chunks: queue.Queue = queue.Queue()
+
+    def callback(indata, frames, time_info, status):
+        chunks.put(indata[:, 0].copy())
+
+    try:
+        with sd.InputStream(samplerate=sample_rate, channels=1, dtype=config.DTYPE,
+                            device=device, blocksize=frame_length, callback=callback):
+            while not segmenter.done:
+                try:
+                    chunk = chunks.get(timeout=2.0)
+                except queue.Empty:
+                    raise DeviceError("The microphone stopped sending audio.") from None
+                event = segmenter.feed(chunk)
+                if event and on_event and event != "done":
+                    on_event(event)
+    except (sd.PortAudioError, ValueError) as exc:
+        raise DeviceError(f"Could not record from device {device!r}: {exc}") from exc
+
+    return segmenter.result(), segmenter.stop_reason

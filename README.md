@@ -1,21 +1,17 @@
+# Local Voice Agent — Week 2: Voice-to-Text Note Taker
 
-# Local Voice Agent — Week 1: Microphone Recorder & Playback Tester
+This is week 2 of my 4-week project to build a **voice assistant that runs fully on my own computer**. No cloud, no API keys.
 
-This is the first week of my 4-week project to build a **voice assistant that runs fully on my own computer**. No cloud, no API keys. You talk, it listens, it thinks with a local AI model, and it talks back.
+In [Week 1](docs/WEEK1.md) I made sure my program could hear me and play sound back. This week, I taught it to **understand what I say**.
 
-Before I can build any of that, I need to be sure one basic thing works: **can my program hear me, and can it play sound back?** That is what Week 1 is about.
+The mini project is a **voice note taker**:
 
-So this week I built a small command-line tool that can:
+1. I start talking.
+2. It records, and **stops by itself** when I stop talking.
+3. It turns my speech into text using **Whisper**, running locally.
+4. It asks if I want to keep it, then saves it as a note.
 
-- list all the microphones and speakers on my computer
-- play a test beep to check my speakers
-- show a live "volume bar" that moves when I talk, to check my mic
-- record my voice and save it as a WAV file
-- play the recording back
-- show details about the file (length, sample rate, size, and so on)
-- warn me if my recording is too quiet or too loud
-
-It sounds simple, but I learned a lot about how digital audio actually works while building it.
+I also built a small tool to **measure how accurate the speech recognition is** on my own voice, so I can pick the best Whisper model for my computer instead of guessing.
 
 ---
 
@@ -23,16 +19,21 @@ It sounds simple, but I learned a lot about how digital audio actually works whi
 
 - [The Full 4-Week Plan](#the-full-4-week-plan)
 - [What I Learned This Week](#what-i-learned-this-week)
-- [Audio Basics (Explained Simply)](#audio-basics-explained-simply)
+- [How It Works (The Pipeline)](#how-it-works-the-pipeline)
+- [Whisper Basics (Explained Simply)](#whisper-basics-explained-simply)
+- [Voice Activity Detection (VAD)](#voice-activity-detection-vad)
+- [Audio Preprocessing](#audio-preprocessing)
+- [Measuring Quality: WER and RTF](#measuring-quality-wer-and-rtf)
 - [Project Structure](#project-structure)
-- [What Each File Does](#what-each-file-does)
+- [What Each New File Does](#what-each-new-file-does)
 - [Setup](#setup)
 - [How to Use It](#how-to-use-it)
+- [Testing Whisper on My Own Voice](#testing-whisper-on-my-own-voice)
 - [Running the Tests](#running-the-tests)
 - [Settings You Can Change](#settings-you-can-change)
-- [Problems I Hit and How to Fix Them](#problems-i-hit-and-how-to-fix-them)
+- [Problems and How to Fix Them](#problems-and-how-to-fix-them)
 - [Small Experiments to Try](#small-experiments-to-try)
-- [What's Next (Week 2)](#whats-next-week-2)
+- [What's Next (Week 3)](#whats-next-week-3)
 
 ---
 
@@ -40,293 +41,485 @@ It sounds simple, but I learned a lot about how digital audio actually works whi
 
 | Week | Topic | Mini Project |
 |------|-------|--------------|
-| **1** | **Python + Audio** | **Mic recorder and playback tester (this repo)** |
-| 2 | Speech Recognition (Whisper) | Voice-to-text note taker |
+| 1 | Python + Audio | [Mic recorder and playback tester](docs/WEEK1.md) |
+| **2** | **Speech Recognition (Whisper)** | **Voice-to-text note taker (this week)** |
 | 3 | Local LLM (Ollama) + Text-to-Speech (Piper) | Ask a question in text, hear a spoken answer |
 | 4 | Putting it all together | Complete local voice agent |
-
-Each week builds on the one before. The `audio/` code I wrote this week will be reused in every later week.
 
 ---
 
 ## What I Learned This Week
 
-**Python**
-- Splitting code into **modules** (separate files) where each file has one job
-- Writing small, clear **functions** with default values and type hints
-- Making my own **custom exceptions** so errors are easy to understand and catch
-- Using **pip** and a **virtual environment** so the project's packages don't mix with the rest of my system
-- Writing **tests** with `pytest`
+**Speech recognition**
+- What Whisper is and how the different model sizes compare
+- Why `faster-whisper` is better than the original package for running on a CPU
+- Why Whisper sometimes "hears" words in silence, and how to filter them out
+- How to give Whisper hints for words it gets wrong
 
 **Audio**
-- What **sample rate**, **channels**, and **bit depth** mean
-- How a **WAV file** is built
-- How to measure loudness in **dBFS**
-- What **clipping** is and why it ruins recordings
-- The difference between **recording a fixed length** and **streaming audio live** with a callback
+- How to detect when someone starts and stops talking (VAD)
+- How to convert any audio into the exact format Whisper needs
+- Why you can't just drop samples to change the sample rate
+
+**Measuring and testing**
+- How to measure accuracy with **Word Error Rate (WER)**
+- How to measure speed with **Real-Time Factor (RTF)**
+- How to test code that needs a microphone or an AI model, **without** a microphone or a model (using fakes)
+
+**Python**
+- `dataclass` for clean result objects
+- `argparse` with sub-commands for a command-line tool
+- Using a `queue` to pass data safely from an audio callback to the main program
+- Loading a heavy library only when it's needed (lazy loading)
 
 ---
 
-## Audio Basics (Explained Simply)
+## How It Works (The Pipeline)
 
-I didn't know most of this before starting, so I'm writing it down here in plain words.
+A "pipeline" just means a chain of steps, where the output of one step is the input of the next:
 
-### Sound on a computer is just a list of numbers
+```
+Microphone
+     │
+     ▼
+ ┌──────────────────────┐
+ │ Record until silence │  audio/recorder.py + audio/vad.py
+ │ (VAD decides when    │  "Is this person still talking?"
+ │  to stop)            │
+ └──────────────────────┘
+     │  int16 audio
+     ▼
+ ┌──────────────────────┐
+ │ Preprocess           │  audio/preprocess.py
+ │ → float32, mono,     │  "Put it in the format Whisper wants"
+ │   16 kHz             │
+ └──────────────────────┘
+     │  float32 audio
+     ▼
+ ┌──────────────────────┐
+ │ Whisper (STT)        │  stt/whisper_stt.py
+ │ → text + timing      │  "What did they say?"
+ └──────────────────────┘
+     │  text
+     ▼
+ ┌──────────────────────┐
+ │ Save note            │  notes_store.py
+ │ → notes/2026-09-29.md│
+ └──────────────────────┘
+```
 
-A microphone turns air vibrations into an electrical signal. The computer measures that signal many times per second and stores each measurement as a number. Each number is called a **sample**.
+STT means **Speech-To-Text**.
 
-So a recording is really just a long list of numbers. In Python, I store it as a **NumPy array**.
+---
 
-### Sample rate — how many numbers per second
+## Whisper Basics (Explained Simply)
 
-The **sample rate** is how many samples are taken each second. It's measured in **Hz**.
+### What is Whisper?
 
-| Sample rate | Where it's used |
-|-------------|-----------------|
-| 8,000 Hz | Old phone calls |
-| **16,000 Hz** | **Speech recognition (what I use)** |
-| 44,100 Hz | Music CDs |
-| 48,000 Hz | Video and most modern devices |
+Whisper is a speech recognition model made by OpenAI and released for free in 2022. It was trained on about 680,000 hours of audio from the internet, which is why it handles accents and background noise quite well. It also works in many languages.
 
-A higher rate captures more detail, but also makes bigger files. For speech, 16,000 Hz is enough. And the main reason I picked it: **Whisper (the speech-to-text model for Week 2) expects 16 kHz audio**. By recording in that format from day one, I won't need to convert anything later.
+The best part for this project: **the model files can be downloaded and run completely offline**.
 
-### Channels — mono or stereo
+### How it works (the short version)
 
-- **Mono (1 channel):** one stream of sound
-- **Stereo (2 channels):** separate left and right streams
+1. Whisper splits audio into pieces of up to 30 seconds.
+2. It turns each piece into a **spectrogram**: a picture showing which sound frequencies are present at each moment.
+3. The model "reads" this picture and writes out the most likely words, one small piece at a time.
 
-A voice assistant only needs to hear one voice, so I use **mono**. It's also half the file size.
+### Model sizes
 
-### Bit depth — how exact each number is
+Whisper comes in different sizes. Bigger models are more accurate but slower and need more memory.
 
-**Bit depth** is how much space each sample gets. I use **16-bit**, which means each sample is a whole number between **-32,768 and 32,767**. This is the standard for WAV files and speech. In the code, this is the `int16` data type.
+| Model | Download size (about) | Speed | Accuracy |
+|-------|----------------------|-------|----------|
+| `tiny` | 75 MB | Fastest | Lowest |
+| `base` | 145 MB | Fast | OK |
+| `small` | 480 MB | Medium | Good |
+| `medium` | 1.5 GB | Slow on CPU | Very good |
+| `large-v3` | 3 GB | Very slow on CPU | Best |
 
-### WAV files
+Models ending in **`.en`** (like `base.en`) only understand English. For English speech, they are a bit more accurate than the same-size multilingual model. I use `base.en` as the default because it's a good balance on a normal laptop.
 
-A **WAV** file is the simplest audio format. It has a small **header** at the start (which stores the sample rate, channels, and bit depth), followed by the raw sample numbers. There's no compression, so it's easy to read and write. Python even has a built-in `wave` module for it, so I didn't need an extra library.
+**The sizes are only a rough guide.** The real speed depends on your computer, which is why I built the evaluation tool (see [Testing Whisper on My Own Voice](#testing-whisper-on-my-own-voice)).
 
-**Quick math for file size:**
-16,000 samples/second × 2 bytes per sample × 1 channel = **32 KB per second**.
-So a 5-second recording is about **156 KB**.
+### Why faster-whisper?
 
-### dBFS — measuring loudness
+There are two ways to run Whisper in Python:
 
-**dBFS** means "decibels relative to full scale". It sounds scary, but the idea is simple:
+- **`openai-whisper`**: the original package. It uses PyTorch and is quite slow on a CPU.
+- **`faster-whisper`**: runs the same models using a faster engine called CTranslate2. It gives the same results, but is several times faster and uses less memory.
 
-- **0 dBFS** = the loudest sound that can be stored
-- Every number below that is quieter, so values are **negative**
-- **-inf** (minus infinity) = total silence
+Since everything runs on my own computer, speed matters a lot. So I use `faster-whisper`.
 
-Rough guide for speech near a mic:
+### int8 — making the model smaller and faster
 
-| Level | Meaning |
-|-------|---------|
-| 0 dBFS | Too loud, probably clipping |
-| -10 to -30 dBFS | Good speaking level |
-| below -40 dBFS | Too quiet, the mic might be wrong or muted |
+A model is basically millions of numbers. Normally each number is stored with high detail (32-bit or 16-bit). **int8** stores each number with less detail (8-bit). The model becomes faster and smaller, and the accuracy loss is usually very small. This is called **quantization**. On a CPU, I use `int8`.
 
-My program shows two numbers:
-- **Peak** — the single loudest moment
-- **Average (RMS)** — the overall loudness. RMS is just a math way of taking the average that works well for sound waves
+### Beam size
 
-### Clipping — when it's too loud
+When Whisper picks words, it can either:
+- take the single best guess at each step (`beam_size = 1`, fastest), or
+- keep several possible sentences at once and choose the best one at the end (`beam_size = 5`, a bit slower but a bit more accurate).
 
-If the sound is louder than the biggest number 16-bit can hold (32,767), the extra part is simply cut off. This is called **clipping**, and it makes the audio sound crackly and broken. It also makes speech recognition worse. My tester counts clipped samples and warns you if it finds any.
+This is called **beam search**.
 
-### Two ways to record
+### Hallucinations — when Whisper makes things up
 
-1. **Fixed recording** (`record()` in `recorder.py`): "Record exactly 5 seconds, then give me all the audio." Simple, and good for testing.
-2. **Streaming with a callback** (`monitor_levels()` in `recorder.py`): the audio library keeps calling my function many times per second, each time with a small new chunk of sound. This is how the live volume bar works.
+This surprised me. If you give Whisper silence or just noise, it sometimes still writes text, like **"Thank you."** or **"Thanks for watching!"** This happens because it learned from lots of online videos that end with those words.
 
-The streaming way is the one a real voice agent uses, because it needs to listen all the time. I'll come back to it in Week 4.
+I use three protections against this:
+
+1. **VAD filter** (`vad_filter=True`): faster-whisper skips silent parts before transcribing.
+2. **Segment filter**: Whisper gives each piece of text two scores:
+   - `no_speech_prob`: how likely it thinks this part is **not** speech
+   - `avg_logprob`: how confident it is about the words (closer to 0 = more confident)
+
+   If a piece is probably not speech **and** the model isn't confident, I drop it. This is the same rule Whisper uses internally.
+3. **`condition_on_previous_text=False`**: this stops Whisper from using its earlier text as context. It helps prevent the same sentence from repeating over and over.
+
+### Initial prompt — giving Whisper hints
+
+Whisper often gets unusual words wrong, like names or tech terms ("Ollama" may come out as "Oh Lama"). You can give it a hint with `WHISPER_INITIAL_PROMPT` in `config.py`:
+
+```python
+WHISPER_INITIAL_PROMPT = "Ollama, Piper, Whisper, Python"
+```
+
+Whisper then treats these words as more likely.
+
+---
+
+## Voice Activity Detection (VAD)
+
+In Week 1, I recorded for a fixed time, like 5 seconds. That's not how a real assistant works. You don't want to wait 5 seconds after saying "hi", and a long sentence would get cut off.
+
+**VAD** means **Voice Activity Detection**: working out when someone is talking and when they stopped.
+
+### How my VAD works
+
+It's a simple **energy-based** VAD. "Energy" just means loudness.
+
+1. **Calibrate:** for the first half second, it listens to the room and measures the background noise. (That's why the app asks you to stay quiet for a moment.)
+2. **Set a threshold:** anything **10 dB louder** than the room noise counts as speech. The threshold also has limits (-50 to -25 dBFS), so it still works in very quiet or noisy rooms.
+3. **Check small chunks:** audio is checked in 30-millisecond pieces.
+
+### The three states
+
+```
+  WAITING ───(3 loud chunks in a row)───► SPEAKING ───(1.2 s of silence)───► DONE
+     │                                        │
+     └──(no speech for 8 s)──► DONE           └──(60 s limit)──► DONE
+         reason: "no_speech"                      reason: "max_length"
+```
+
+A few details that made a big difference:
+
+- **3 chunks in a row:** a single click or desk tap is only one loud chunk, so it doesn't count as speech.
+- **Pre-roll:** it keeps the last 0.3 seconds of audio from **before** speech was detected. Without this, the start of the first word gets cut off.
+- **Trimming the tail:** after you stop, it waits 1.2 seconds to be sure you're done, then removes most of that silence from the recording.
+
+### Why the logic is in its own class
+
+The `SpeechSegmenter` class doesn't know anything about microphones. You just feed it chunks of audio, and it tells you what's happening. This means I can **test it with fake audio** (a beep with silence around it) and check it makes the right decisions. No microphone needed.
+
+### Limits
+
+A loud fan, music, or a TV can fool an energy-based VAD, because it only looks at loudness. A smarter option is a small neural network VAD, like **Silero VAD**. I may switch to it later.
+
+### The queue
+
+The microphone stream calls my callback function many times per second. The callback has to be very fast, or audio gets dropped. So it only does one thing: put each chunk into a **queue**. The main program takes chunks out of the queue and runs the VAD. A queue is a safe way to pass data between two parts of a program running at the same time.
+
+---
+
+## Audio Preprocessing
+
+Whisper needs audio in exactly this format:
+
+| Property | What Whisper wants | What I might have |
+|----------|--------------------|-------------------|
+| Number type | `float32` from -1.0 to 1.0 | `int16` from -32768 to 32767 |
+| Channels | Mono (1 channel) | Maybe stereo from a WAV file |
+| Sample rate | 16,000 Hz | Maybe 44,100 or 48,000 Hz from a WAV file |
+
+`prepare_for_whisper()` in `audio/preprocess.py` fixes all three:
+
+1. **`to_float32`:** divides by 32768 to get numbers between -1.0 and 1.0.
+2. **`to_mono`:** if there are two channels, it averages them into one.
+3. **`resample`:** changes the sample rate.
+
+### Why resampling needs care
+
+To go from 48,000 Hz to 16,000 Hz, you might think "just keep every 3rd sample". But that creates strange noise, called **aliasing**. High sounds that don't fit in the new rate get "folded" into fake lower sounds. The proper way is to filter out those high sounds first, then reduce the samples. `scipy.signal.resample_poly` does both.
+
+There are also two optional steps:
+
+- **`trim_silence`:** cuts quiet parts from the start and end.
+- **`normalize_peak`:** makes quiet recordings louder. It skips audio that is basically silence, because boosting silence would just boost the noise.
+
+---
+
+## Measuring Quality: WER and RTF
+
+"It seems to work" isn't a good test. I wanted real numbers.
+
+### WER — Word Error Rate (accuracy)
+
+WER counts how many words are wrong, compared to what was really said:
+
+```
+WER = (substituted words + deleted words + inserted words) / words in the real sentence
+```
+
+Example:
+
+```
+What I said:    "turn on the  kitchen light"
+Whisper wrote:  "turn on a    kitchen light please"
+                          ↑                   ↑
+                   substitution          insertion
+```
+
+2 errors ÷ 5 words = **40% WER**.
+
+- **0%** = perfect
+- **Lower is better**
+- It can go above 100% if Whisper adds lots of extra words
+
+Before comparing, both texts are **normalized**: made lowercase and with punctuation removed. So "Hello, world!" and "hello world" count as the same.
+
+One limit: numbers are not converted. "5" and "five" count as different words. So a sentence with numbers may show errors even when Whisper understood it correctly.
+
+To count errors, I use **edit distance** (also called Levenshtein distance). It finds the smallest number of changes needed to turn one sentence into the other.
+
+### RTF — Real-Time Factor (speed)
+
+```
+RTF = time taken to transcribe / length of the audio
+```
+
+- **RTF 0.2** = 10 seconds of audio took 2 seconds. Fast.
+- **RTF 1.0** = it takes as long as the audio itself.
+- **Above 1.0** = slower than real time. Too slow for a voice assistant.
+
+For a voice assistant, low RTF matters as much as low WER. Nobody wants to wait 10 seconds for a reply.
 
 ---
 
 ## Project Structure
 
+Files marked **NEW** were added this week.
+
 ```
 voice_agent/
 │
-├── mic_tester.py        # The main program (the menu you interact with)
-├── config.py            # All settings in one place
-├── requirements.txt     # Python packages needed
-├── .gitignore           # Files Git should not upload
-├── README.md            # This file
+├── note_taker.py        # NEW - Week 2 mini project
+├── evaluate_stt.py      # NEW - measure Whisper accuracy and speed
+├── notes_store.py       # NEW - save/read notes as Markdown
+├── mic_tester.py        # Week 1 mini project
+├── config.py            # All settings (Week 2 settings added)
+├── requirements.txt
+├── .gitignore
+├── README.md
 │
-├── audio/               # All the audio code (reused in later weeks)
+├── docs/
+│   └── WEEK1.md         # Week 1 write-up
+│
+├── audio/
 │   ├── __init__.py
-│   ├── exceptions.py    # Custom error types
-│   ├── devices.py       # Finds mics and speakers
-│   ├── recorder.py      # Records from the mic
-│   ├── player.py        # Plays sound + makes a test beep
-│   ├── wav_io.py        # Saves and loads WAV files
-│   └── levels.py        # Measures loudness and clipping
+│   ├── exceptions.py
+│   ├── devices.py
+│   ├── recorder.py      # + record_until_silence()
+│   ├── player.py
+│   ├── wav_io.py
+│   ├── levels.py        # now also works with float audio
+│   ├── preprocess.py    # NEW - get audio ready for Whisper
+│   └── vad.py           # NEW - detect when someone is talking
+│
+├── stt/                 # NEW - speech-to-text package
+│   ├── __init__.py
+│   ├── exceptions.py    # STTError
+│   ├── whisper_stt.py   # Whisper wrapper
+│   └── metrics.py       # Word Error Rate
 │
 ├── tests/
-│   ├── __init__.py
-│   └── test_audio.py    # Tests that run without a microphone
+│   ├── test_audio.py    # Week 1 tests
+│   └── test_stt.py      # NEW - Week 2 tests
 │
-└── temp/                # Recordings are saved here (not uploaded to Git)
+├── models/              # Whisper model is downloaded here (not uploaded to Git)
+├── notes/               # Your saved notes (not uploaded to Git)
+└── temp/                # Recordings (not uploaded to Git)
 ```
-
-The `__init__.py` files tell Python that a folder is a **package**, so I can write imports like `from audio.recorder import record`.
 
 ---
 
-## What Each File Does
+## What Each New File Does
 
-### `mic_tester.py` — the main program
+### `note_taker.py` — the main program
 
-This shows the menu, reads your choice, and calls the right function. It also catches errors. If something goes wrong (for example, no mic is found, or you type letters instead of a number), it prints a clear message and returns to the menu instead of crashing.
-
-If you press **Ctrl+C** while recording or playing, it stops the audio and goes back to the menu.
-
-### `config.py` — settings
-
-All the numbers that I might want to change are here: sample rate, channels, recording length, which device to use, and so on. This way, I never have to dig through the code to change a setting.
-
-### `audio/exceptions.py` — custom errors
-
-I made three error types:
+Loads the Whisper model once at the start (this takes a few seconds), then shows a menu:
 
 ```
-AudioError          ← the parent. Catch this to catch any audio problem
-├── DeviceError     ← mic or speaker missing, busy, or doesn't support the settings
-└── WavFileError    ← WAV file missing, broken, or wrong format
+=== Voice Note Taker ===
+ 1. Record a note (stops when you stop talking)
+ 2. Transcribe a WAV file
+ 3. Show today's notes
+ 4. Show settings
+ 0. Quit
 ```
 
-Because they all come from `AudioError`, the main program only needs one line, `except AudioError:`, to handle all of them. I also use `raise ... from exc`, which keeps the original error attached. That makes debugging much easier.
+After each recording, it shows the text plus some stats: the language, audio length, how long it took, and the RTF. Then it asks if you want to save the note.
 
-### `audio/devices.py` — finding devices
+### `stt/whisper_stt.py` — the Whisper wrapper
 
-- `print_devices()` prints a table of every mic and speaker, with a number for each one. `>` marks the default mic and `<` marks the default speaker.
-- `require_sounddevice()` handles a common setup problem. The `sounddevice` library needs a system library called **PortAudio**. If PortAudio is missing, instead of a confusing crash, you get a message telling you exactly how to install it for your operating system.
+The `WhisperSTT` class:
 
-### `audio/recorder.py` — recording
+- **`load()`** loads the model. The first time, it downloads it into `models/whisper/`. It only loads once, and after that it's reused.
+- **`transcribe(audio, sample_rate)`** takes any audio, preprocesses it, runs Whisper, removes likely hallucinations, and returns a `TranscriptResult`.
+- **`transcribe_file(path)`** does the same for a WAV file.
 
-- `record(seconds)` records a fixed amount of time and returns the audio as a NumPy array. Before recording, it checks that the mic supports the chosen settings, so you get a clear error early.
-- `monitor_levels(seconds)` opens a live stream and shows a moving volume bar, like this:
+`TranscriptResult` is a `dataclass` that holds the text, language, timings, and each segment. It also works out the RTF.
 
+Two design choices I'm happy with:
+
+- **Lazy import:** `faster_whisper` is only imported inside `load()`. If it's not installed, you get a clear message telling you what to install, instead of a crash when the program starts.
+- **You can pass in a fake model:** `WhisperSTT(model=fake)`. The tests use this to check my code without downloading a real model.
+
+### `stt/metrics.py` — measuring accuracy
+
+- `normalize_text()` makes text lowercase and removes punctuation (but keeps words like "don't").
+- `word_error_rate()` compares two sentences and returns the WER, plus how many substitutions, deletions, and insertions there were.
+
+### `stt/exceptions.py`
+
+One error type, `STTError`, for when the model can't load or transcription fails.
+
+### `audio/vad.py` — voice activity detection
+
+- `EnergyVAD` decides if a single chunk is speech.
+- `SpeechSegmenter` decides when speech **starts** and **ends**, using the states described above.
+
+### `audio/recorder.py` — new function
+
+`record_until_silence()` opens the mic stream, sends chunks through the queue to the `SpeechSegmenter`, and returns the audio and the reason it stopped. It also calls `on_event` when it's ready to listen and when it hears you, so the app can show messages like "Listening... speak now."
+
+### `audio/preprocess.py` — preprocessing
+
+All the conversion steps described in [Audio Preprocessing](#audio-preprocessing).
+
+### `notes_store.py` — saving notes
+
+Saves one Markdown file per day. A note file looks like this:
+
+```markdown
+# Notes — 2026-09-29
+
+- **14:30:15** — Buy milk and eggs on the way home
+- **16:02:41** — Idea for week 3: make the agent answer in a short sentence first
 ```
-[####################....................]  -28.4 dBFS
-```
 
-One thing I learned: the callback function must be **very fast**. If it's slow, audio chunks get dropped. So the callback only saves the latest level, and the main loop does the printing.
+Markdown files are easy to read on GitHub or in any text editor.
 
-### `audio/player.py` — playback
+### `evaluate_stt.py` — testing accuracy on my voice
 
-- `play(audio, sample_rate)` plays a NumPy array through the speakers.
-- `play_wav(path)` loads a WAV file and plays it.
-- `make_tone()` creates a 440 Hz beep using a sine wave. This lets me test my speakers even without a microphone. It also fades the beep in and out very quickly, because a sudden start or stop makes a "click" sound.
-
-### `audio/wav_io.py` — WAV files
-
-- `save_wav(audio, path, sample_rate)` writes audio to a WAV file. It creates the folder if it doesn't exist.
-- `load_wav(path)` reads a WAV file back into a NumPy array. It raises a `WavFileError` if the file is missing, broken, or not 16-bit.
-- `wav_info(path)` returns the file's details without loading all the audio.
-
-### `audio/levels.py` — measuring sound
-
-- `rms_dbfs(audio)` gives the average loudness in dBFS.
-- `audio_stats(audio, sample_rate)` gives duration, peak level, average level, and the number of clipped samples.
-- `level_bar(db)` turns a dB number into the text bar you see in the live meter.
-
-### `tests/test_audio.py` — tests
-
-These tests check the parts that **don't need a microphone**, so they run anywhere, even on GitHub's servers. They check that:
-
-- saving a WAV file and loading it back gives the exact same audio
-- file details (channels, bit depth, length) are correct
-- the wrong data type is rejected
-- missing or broken files raise the right error
-- a full-volume sine wave measures about -3 dBFS (this is a known fact about sine waves, so it's a good check that my math is right)
-- clipping is counted correctly
+Explained in [Testing Whisper on My Own Voice](#testing-whisper-on-my-own-voice).
 
 ---
 
 ## Setup
 
-You'll need **Python 3.10 or newer**.
-
-### 1. Get the code
-
-```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
-```
-
-### 2. Create a virtual environment
-
-A virtual environment is a private folder for this project's packages. It keeps them separate from other Python projects on your computer.
-
-```bash
-python -m venv .venv
-```
-
-Turn it on:
-
-```bash
-# Windows
-.venv\Scripts\activate
-
-# macOS / Linux
-source .venv/bin/activate
-```
-
-You'll see `(.venv)` at the start of your terminal line when it's on.
-
-### 3. Install the packages
+If you already set up Week 1, just install the new packages:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-This installs:
-- **sounddevice** — talks to the mic and speakers
-- **numpy** — stores and processes audio as arrays of numbers
-- **pytest** — runs the tests
+New packages this week:
 
-### 4. Linux only: install PortAudio
+- **faster-whisper** — runs Whisper models quickly
+- **scipy** — used for resampling audio properly
+
+### Fresh setup
 
 ```bash
-sudo apt install libportaudio2
+git clone https://github.com/<your-username>/<your-repo>.git
+cd <your-repo>
+
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+
+pip install -r requirements.txt
 ```
 
-On Windows and macOS, PortAudio usually comes bundled with `sounddevice`. If not on macOS, run `brew install portaudio`.
+**The first run downloads the Whisper model**, so you need internet the first time. After that, it works fully offline.
 
 ---
 
 ## How to Use It
 
-Run the tester from the project folder:
+```bash
+python note_taker.py
+```
+
+1. Wait for "Model ready".
+2. Choose **option 1**.
+3. **Stay quiet** for half a second while it measures the room noise.
+4. When you see `>> Listening... speak now.`, say your note.
+5. Stop talking. After about a second, it stops recording by itself.
+6. Check the text, then press **Enter** to save it (or type `n` to skip).
+
+Choose **option 3** to see today's notes.
+
+**Option 2** lets you transcribe any 16-bit WAV file. For example, a recording you made with `mic_tester.py` in Week 1.
+
+---
+
+## Testing Whisper on My Own Voice
+
+Public test results don't tell me how Whisper does with **my** voice, **my** accent, **my** mic, and **my** laptop. So I built `evaluate_stt.py`.
+
+### Step 1 — Record test sentences
 
 ```bash
-python mic_tester.py
+python evaluate_stt.py record
 ```
 
-You'll see this menu:
+It shows sentences one by one. I read each one out loud. The sentences include easy ones, numbers, names, and tech words, so I can see where Whisper struggles. Each recording is saved as a pair:
 
 ```
-=== Mic Recorder & Playback Tester ===
- 1. List audio devices
- 2. Play test tone (check speakers)
- 3. Live mic level meter (check mic)
- 4. Record and save WAV
- 5. Play last recording
- 6. Show last recording info
- 0. Quit
+tests/stt_samples/sample_01.wav   ← my voice
+tests/stt_samples/sample_01.txt   ← what I actually said
 ```
 
-### Suggested order the first time
+### Step 2 — Compare models
 
-1. **Option 1** — See your devices. Note the number of the mic and speaker you want.
-2. **Option 2** — You should hear a beep. If yes, your speakers work.
-3. **Option 3** — Talk. The bar should move. If it stays empty, the wrong mic is selected, or it's muted.
-4. **Option 4** — Record yourself. Press Enter to use the default 5 seconds, or type a number. After recording, you'll see the levels and a quick quality check.
-5. **Option 5** — Listen to your recording.
-6. **Option 6** — See the file details.
+```bash
+python evaluate_stt.py run --models tiny.en base.en small.en
+```
 
-Recordings are saved in the `temp/` folder with the date and time in the name, for example `recording_20260928_143015.wav`.
+For each model, it transcribes every sample and shows the WER and RTF. When something is wrong, it shows what I said next to what Whisper wrote. At the end, there's a summary table like this:
+
+```
+=== Summary ===
+Model            WER    RTF    Load
+tiny.en        ...%   ...    ...s
+base.en        ...%   ...    ...s
+small.en       ...%   ...    ...s
+```
+
+The overall WER counts **all errors divided by all words**. So longer sentences count more than short ones.
+
+### My results
+
+*(Fill in after running on your own computer.)*
+
+| Model | WER | RTF | Load time |
+|-------|-----|-----|-----------|
+| `tiny.en` |39.3%  | 0.08| 11.1s |
+| `base.en` |34.4%  | 0.13| 0.7s |
+| `small.en` |34.4%  | 0.36| 48.2s|
+
+My computer: GPU: GTX 1650, 4GB RAM.
 
 ---
 
@@ -336,73 +529,117 @@ Recordings are saved in the `temp/` folder with the date and time in the name, f
 python -m pytest
 ```
 
-You should see something like:
+You should see:
 
 ```
-7 passed
+25 passed
 ```
 
-Use `python -m pytest` instead of just `pytest`, so Python can find the `audio` package from the project folder.
+None of the tests need a microphone or a downloaded model. They check:
+
+- **Preprocessing:** number conversion, stereo to mono, resampling length, trimming, and normalizing.
+- **VAD:** it stops after silence, it gives up when nobody talks, it stops at the max length, and a single click doesn't count as speech.
+- **WER:** it gets the exact error counts right for known examples.
+- **Whisper wrapper:** using a **fake model** that returns one real sentence and one "Thank you." that looks like silence. The test checks that the fake one is removed, and the audio was converted to 16 kHz float32 before being sent to the model.
+- **Recording loop:** using a **fake microphone** that sends pre-made audio (noise, then a beep, then silence) to the real `record_until_silence()` function.
+- **Notes:** saving, reading, and rejecting empty notes.
+
+Writing fakes was one of the most useful things I learned this week. It lets me test code that normally needs hardware or a big AI model.
 
 ---
 
 ## Settings You Can Change
 
-Open `config.py`:
+All in `config.py`.
+
+### Whisper
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
-| `SAMPLE_RATE` | `16000` | Samples per second |
-| `CHANNELS` | `1` | 1 = mono, 2 = stereo |
-| `DTYPE` | `"int16"` | Sample format (16-bit) |
-| `RECORD_SECONDS` | `5` | Default recording length |
-| `INPUT_DEVICE` | `None` | Which mic. `None` = system default. You can use a number from option 1, like `3`, or part of the name, like `"USB"` |
-| `OUTPUT_DEVICE` | `None` | Which speaker, same rules as above |
-| `TOO_QUIET_DBFS` | `-40.0` | Below this level, you get a "too quiet" warning |
+| `WHISPER_MODEL` | `"base.en"` | Model size (see table above) |
+| `WHISPER_DEVICE` | `"cpu"` | `"cpu"`, `"cuda"` (NVIDIA GPU), or `"auto"` |
+| `WHISPER_COMPUTE_TYPE` | `"int8"` | `"int8"` for CPU, `"float16"` for GPU |
+| `WHISPER_LANGUAGE` | `"en"` | `None` = auto-detect (needs a model without `.en`) |
+| `WHISPER_BEAM_SIZE` | `5` | `1` = fastest, `5` = a bit more accurate |
+| `WHISPER_VAD_FILTER` | `True` | Skip silent parts inside Whisper |
+| `WHISPER_INITIAL_PROMPT` | `None` | Hint words, like `"Ollama, Piper"` |
+| `NO_SPEECH_PROB_THRESHOLD` | `0.6` | Used to drop segments that look like silence |
+| `LOG_PROB_THRESHOLD` | `-1.0` | Used to drop segments with low confidence |
+
+### Recording and VAD
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `SILENCE_SECONDS` | `1.2` | Stop after this much silence |
+| `START_TIMEOUT_SECONDS` | `8.0` | Give up if you don't start talking in this time |
+| `MAX_RECORD_SECONDS` | `60.0` | Longest possible recording |
+| `VAD_CALIBRATION_SECONDS` | `0.5` | Time spent measuring room noise |
+| `VAD_MARGIN_DB` | `10.0` | How much louder than the room speech must be |
+| `VAD_MIN_THRESHOLD_DBFS` | `-50.0` | Lowest allowed threshold |
+| `VAD_MAX_THRESHOLD_DBFS` | `-25.0` | Highest allowed threshold |
+| `PRE_ROLL_SECONDS` | `0.3` | Audio kept from before speech started |
+
+### Notes
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `KEEP_NOTE_AUDIO` | `True` | Also save each note's audio in `temp/` |
 
 ---
-##  Test Results
 
-The following screenshots demonstrate the microphone recording and playback tests.
+## Problems and How to Fix Them
 
- [View Microphone Recorder & Playback Tester Results](./Microphone%20Recorder%20%26%20Playback%20Tester_results/)
+**"Could not load Whisper model"**
+- The first run needs internet to download the model.
+- Check the model name is spelled right (for example `base.en`, not `base-en`).
+- If you set `WHISPER_DEVICE = "cuda"` but don't have an NVIDIA GPU set up, change it back to `"cpu"`.
 
-## Problems I Hit and How to Fix Them
+**It stops recording while I'm still talking**
+Increase `SILENCE_SECONDS` to something like `1.8`. Short pauses between words can count as "silence".
 
-**"PortAudio library not found"**
-The system audio library is missing. See step 4 of Setup.
+**It never stops recording**
+The room is probably too noisy, so your "silence" is still louder than the threshold. Try:
+- staying fully quiet during the calibration at the start
+- **increasing** `VAD_MARGIN_DB`, for example to `15`
+- in a very noisy room, **raising** `VAD_MAX_THRESHOLD_DBFS`, for example to `-20`, so the threshold is allowed to go higher
+- moving away from fans or other noise
 
-**The level bar doesn't move**
-- The wrong mic is probably selected. Run option 1, find your mic's number, and set `INPUT_DEVICE` in `config.py`.
-- Check the mic isn't muted in your system settings.
-- On macOS and Windows, check that your terminal is allowed to use the microphone (in privacy settings).
+**"I didn't hear anything"**
+Your voice may be too quiet for the VAD. Check your mic with `python mic_tester.py` (option 3). You can also **lower** `VAD_MARGIN_DB`, for example to `6`.
 
-**"Invalid sample rate" or similar error**
-Some mics don't support 16,000 Hz directly. Try another device from the list, or set `SAMPLE_RATE = 48000` to test. (For Week 2, I'll add a step to convert to 16 kHz if needed.)
+**Whisper writes "Thank you." when I said nothing**
+This is a hallucination (see above). Make sure `WHISPER_VAD_FILTER = True`. You can also make the filter stricter by lowering `NO_SPEECH_PROB_THRESHOLD` a little, like to `0.5`.
 
-**The recording sounds crackly**
-That's probably clipping. The tester will show a warning. Move back from the mic or lower the mic volume in your system settings.
+**It's too slow**
+- Try a smaller model like `tiny.en`.
+- Set `WHISPER_BEAM_SIZE = 1`.
+- If you have an NVIDIA GPU, set `WHISPER_DEVICE = "cuda"` and `WHISPER_COMPUTE_TYPE = "float16"`.
 
-**The recording is very quiet**
-Speak closer, or raise the mic volume in your system settings.
+**Names or tech words come out wrong**
+Add them to `WHISPER_INITIAL_PROMPT`.
+
+**The first transcription is slower than the rest**
+That's normal. The first run "warms up" the model.
 
 ---
 
 ## Small Experiments to Try
 
-These helped me understand the concepts better:
-
-- Change `SAMPLE_RATE` to `44100`, record 5 seconds, and compare the file size with option 6. It should be about 2.75 times bigger.
-- Change `CHANNELS` to `2` and see what happens to the file size.
-- Whisper into the mic, then speak normally, then speak loudly. Watch how the dBFS number changes.
-- In `player.py`, change the beep frequency from `440` to `880`. It will sound one octave higher.
-- Break something in `wav_io.py` on purpose, then run the tests. See which ones fail.
+- Compare `tiny.en`, `base.en`, and `small.en` with `evaluate_stt.py`. Is the accuracy gain worth the slower speed?
+- Run the evaluation with `WHISPER_BEAM_SIZE = 1`, then `5`. How much do WER and RTF change?
+- Look at which words fail. Add them to `WHISPER_INITIAL_PROMPT` and run the evaluation again. Did the WER go down?
+- Set `WHISPER_VAD_FILTER = False`, then record a note where you say nothing. Does Whisper make something up?
+- Set `WHISPER_LANGUAGE = None` and `WHISPER_MODEL = "base"`, then speak in another language you know. Does it detect it correctly?
+- Record in a quiet room, then with a fan or music on. Compare the WER.
 
 ---
 
-## What's Next (Week 2)
+## What's Next (Week 3)
 
-Next week I'll add **speech recognition**. I'll use the audio recorded by this project and turn it into text using **Whisper**, running locally. The mini project will be a **voice-to-text note taker**: speak, and your words get saved as text notes.
+Now the agent can **hear** and **understand** me. Next week, I'll give it a **brain** and a **voice**:
 
-Because I already record in the exact format Whisper wants (16 kHz, mono, 16-bit), the `audio/` package from this week can plug straight in.
+- **Ollama:** runs a large language model (LLM) locally, so the agent can think of an answer
+- **Prompting and conversation context:** so it remembers what we talked about earlier in the chat
+- **Piper TTS:** turns the answer into spoken audio. TTS means Text-To-Speech.
 
+The mini project: type a question, the local LLM answers, and Piper speaks the answer out loud. In Week 4, I'll connect this week's speech-to-text to the front of it, and the full voice agent will be complete.

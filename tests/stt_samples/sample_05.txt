@@ -1,0 +1,1 @@
+Whisper turns speech into text on my own computer.

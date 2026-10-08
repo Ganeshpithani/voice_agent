@@ -10,11 +10,16 @@ INT16_MAX = 32767
 def rms_dbfs(audio: np.ndarray) -> float:
     """Average loudness in dBFS. 0 = max possible, -inf = total silence.
 
+    Works with int16 audio or float audio in the range -1.0 to 1.0.
+
     Normal speech near a mic is usually between -30 and -10 dBFS.
     """
     if audio.size == 0:
         return -math.inf
-    samples = audio.astype(np.float32) / 32768.0
+    if np.issubdtype(audio.dtype, np.floating):
+        samples = audio.astype(np.float32)            # already in -1.0 .. 1.0
+    else:
+        samples = audio.astype(np.float32) / 32768.0  # int16 -> -1.0 .. 1.0
     rms = float(np.sqrt(np.mean(samples ** 2)))
     return 20 * math.log10(rms) if rms > 0 else -math.inf
 
